@@ -1,0 +1,468 @@
+// server.js - Complete Backend API for MatSelamat.com
+// Node.js + Express + Stripe + Anthropic API
+
+const express = require('express');
+const cors = require('cors');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
+
+// Database (use PostgreSQL in production)
+const db = {
+  claims: new Map(),
+  payments: new Map()
+};
+
+// ============================================
+// 1. CREATE STRIPE CHECKOUT SESSION
+// ============================================
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const { claimData, userEmail } = req.body;
+    
+    // Generate unique claim ID
+    const claimId = `claim_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Store claim data (before payment to preserve user's work)
+    db.claims.set(claimId, {
+      ...claimData,
+      status: 'pending_payment',
+      createdAt: new Date().toISOString()
+    });
+    
+    // Create Stripe Checkout Session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card', 'fpx', 'grabpay'],
+      line_items: [{
+        price_data: {
+          currency: 'myr',
+          product_data: {
+            name: 'Small Claims Document Generation',
+            description: 'Court-ready Form 198 with AI refinement',
+            images: ['https://matselamat.com/og-image.png']
+          },
+          unit_amount: 7900, // RM79.00 in cents
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/claim-builder?resume=${claimId}`,
+      customer_email: userEmail,
+      metadata: {
+        claim_id: claimId,
+        service: 'small_claims_document'
+      },
+      // Enable automatic tax calculation (optional)
+      automatic_tax: { enabled: true }
+    });
+    
+    res.json({ 
+      sessionId: session.id,
+      claimId: claimId,
+      checkoutUrl: session.url
+    });
+    
+  } catch (error) {
+    console.error('Checkout session creation error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// ============================================
+// 2. STRIPE WEBHOOK (Critical for reliability)
+// ============================================
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    // Verify webhook signature
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      const claimId = session.metadata.claim_id;
+      
+      // Mark claim as paid
+      const claim = db.claims.get(claimId);
+      if (claim) {
+        claim.status = 'paid';
+        claim.paidAt = new Date().toISOString();
+        claim.stripeSessionId = session.id;
+        claim.paymentIntentId = session.payment_intent;
+        
+        // Trigger document generation (async)
+        generateDocument(claimId, claim)
+          .then(documentData => {
+            // Send email with document
+            sendDocumentEmail(session.customer_email, documentData);
+          })
+          .catch(err => console.error('Document generation error:', err));
+      }
+      
+      break;
+
+    case 'payment_intent.payment_failed':
+      // Handle failed payment
+      console.log('Payment failed:', event.data.object);
+      break;
+
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+// ============================================
+// 3. VERIFY PAYMENT (Client-side check)
+// ============================================
+app.get('/api/verify-payment', async (req, res) => {
+  try {
+    const { session_id } = req.query;
+    
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    
+    if (session.payment_status === 'paid') {
+      const claimId = session.metadata.claim_id;
+      const claim = db.claims.get(claimId);
+      
+      res.json({
+        payment_status: 'paid',
+        claimId: claimId,
+        claim: claim
+      });
+    } else {
+      res.json({ payment_status: session.payment_status });
+    }
+    
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+// ============================================
+// 4. AI NARRATIVE REFINEMENT (Magic Wand)
+// ============================================
+app.post('/api/ai/refine-narrative', async (req, res) => {
+  try {
+    const { rawDescription, claimantName, defendantName, claimAmount, claimType } = req.body;
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: `Anda adalah pembantu penulisan undang-undang Malaysia yang pakar dalam prosedur tuntutan kecil di bawah Perintah 93 Kaedah-Kaedah Mahkamah 2012.
+
+TUGASAN: Tukar keterangan tidak formal pengguna menjadi naratif yang sesuai untuk Mahkamah bagi Borang 198 (Kenyataan Tuntutan).
+
+INPUT PENGGUNA: ${rawDescription}
+
+BUTIRAN TUNTUTAN:
+- Plaintif: ${claimantName}
+- Defendan: ${defendantName}
+- Amaun: RM${claimAmount}
+- Jenis Tuntutan: ${claimType}
+
+KEPERLUAN:
+1. Gunakan bahasa undang-undang formal dalam Bahasa Melayu
+2. Nyatakan fakta secara kronologi
+3. Rujuk bukti mengikut tarikh/jenis
+4. Patuhi format Perintah 93
+5. Hadkan kepada 200-300 perkataan
+6. Gunakan Bahasa Melayu yang mudah (tidak terlalu teknikal)
+7. Elakkan bahasa emosi
+
+FORMAT OUTPUT:
+Berikan hanya naratif kenyataan tuntutan untuk Borang 198 Bahagian C, tanpa sebarang pengenalan atau penutup.`
+      }]
+    });
+    
+    const refinedText = message.content[0].text;
+    
+    res.json({ refinedNarrative: refinedText });
+    
+  } catch (error) {
+    console.error('AI refinement error:', error);
+    res.status(500).json({ error: 'Refinement failed' });
+  }
+});
+
+// ============================================
+// 5. AI INTERVIEW (Intelligent Questioning)
+// ============================================
+app.post('/api/ai/interview', async (req, res) => {
+  try {
+    const { conversationHistory, claimData } = req.body;
+    
+    const systemPrompt = `Anda sedang menjalankan temu bual untuk mengumpul maklumat bagi kes tuntutan kecil di Malaysia.
+
+KONTEKS: Pengguna menuntut RM${claimData.claimAmount} daripada ${claimData.defendantName} untuk ${claimData.claimType}.
+
+PERATURAN:
+1. Tanya SATU soalan pada satu masa
+2. Mulakan dengan soalan terbuka
+3. Ikuti dengan butiran spesifik
+4. Maksimum 8 soalan keseluruhan
+5. Sesuaikan berdasarkan jawapan sebelumnya
+6. Bersikap empati tetapi profesional
+7. Terangkan mengapa anda bertanya setiap soalan
+8. Gunakan Bahasa Melayu atau English bergantung kepada bahasa pengguna
+
+STATUS SEMASA:
+- Soalan ditanya: ${conversationHistory.length}/8
+- Maklumat dikumpul: ${JSON.stringify(claimData.gatheredInfo || {})}
+
+Buat soalan seterusnya yang paling penting.`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      system: systemPrompt,
+      messages: conversationHistory
+    });
+    
+    res.json({ 
+      question: message.content[0].text,
+      questionsRemaining: 8 - conversationHistory.length
+    });
+    
+  } catch (error) {
+    console.error('AI interview error:', error);
+    res.status(500).json({ error: 'Interview failed' });
+  }
+});
+
+// ============================================
+// 6. DOCUMENT GENERATION (Post-Payment)
+// ============================================
+async function generateDocument(claimId, claimData) {
+  try {
+    // In production, use a proper PDF generation library like PDFKit or Puppeteer
+    // For now, we'll create a structured JSON that can be converted to PDF/DOCX
+    
+    const document = {
+      formType: 'Borang 198',
+      courtType: 'Mahkamah Majistret',
+      caseNumber: `[Akan diisi oleh Mahkamah]`,
+      
+      plaintiffDetails: {
+        name: claimData.claimantName,
+        ic: claimData.claimantIC,
+        address: claimData.claimantAddress,
+        phone: claimData.claimantPhone,
+        email: claimData.claimantEmail
+      },
+      
+      defendantDetails: {
+        name: claimData.defendantName,
+        address: claimData.defendantAddress
+      },
+      
+      claimDetails: {
+        type: claimData.claimType,
+        amount: claimData.claimAmount,
+        narrative: claimData.claimDescription
+      },
+      
+      filingInstructions: {
+        steps: [
+          'Cetak 4 salinan dokumen ini (asal + 3 fotokopi)',
+          'Pergi ke Mahkamah Majistret terdekat',
+          'Bayar fi pemfailan RM10 di kaunter',
+          'Mahkamah akan mengeluarkan notis kepada Defendan',
+          'Hadiri pendengaran apabila dijadualkan'
+        ]
+      },
+      
+      generatedAt: new Date().toISOString(),
+      documentId: `doc_${claimId}`
+    };
+    
+    // Store document
+    db.claims.get(claimId).document = document;
+    db.claims.get(claimId).status = 'document_ready';
+    
+    return document;
+    
+  } catch (error) {
+    console.error('Document generation error:', error);
+    throw error;
+  }
+}
+
+// ============================================
+// 7. DOWNLOAD DOCUMENT ENDPOINTS
+// ============================================
+app.get('/api/documents/:claimId/pdf', async (req, res) => {
+  try {
+    const { claimId } = req.params;
+    const claim = db.claims.get(claimId);
+    
+    if (!claim || claim.status !== 'document_ready') {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    
+    // In production: Generate actual PDF using PDFKit or Puppeteer
+    // For now, return document data
+    res.json({ 
+      message: 'PDF generation endpoint',
+      document: claim.document 
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+app.get('/api/documents/:claimId/docx', async (req, res) => {
+  try {
+    const { claimId } = req.params;
+    const claim = db.claims.get(claimId);
+    
+    if (!claim || claim.status !== 'document_ready') {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    
+    // In production: Generate DOCX using docxtemplater or similar
+    res.json({ 
+      message: 'DOCX generation endpoint',
+      document: claim.document 
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+// ============================================
+// 8. EMAIL NOTIFICATION (SendGrid/Mailgun)
+// ============================================
+async function sendDocumentEmail(email, documentData) {
+  // In production: Use SendGrid, Mailgun, or AWS SES
+  console.log(`Sending document to ${email}`);
+  
+  const emailContent = {
+    to: email,
+    subject: 'Your Small Claims Document is Ready! - MatSelamat.com',
+    html: `
+      <h2>Tahniah! Dokumen Anda Sudah Siap</h2>
+      <p>Terima kasih kerana menggunakan MatSelamat.com. Borang 198 anda telah dijana dengan jayanya.</p>
+      
+      <h3>Langkah Seterusnya:</h3>
+      <ol>
+        <li>Muat turun dokumen (PDF dan DOCX) dari pautan di bawah</li>
+        <li>Cetak 4 salinan</li>
+        <li>Failkan di Mahkamah Majistret terdekat</li>
+        <li>Bayar fi pemfailan RM10</li>
+      </ol>
+      
+      <a href="${process.env.FRONTEND_URL}/documents/${documentData.documentId}" 
+         style="background: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px;">
+        Muat Turun Dokumen
+      </a>
+      
+      <p style="margin-top: 20px; color: #666;">
+        Sokongan: support@matselamat.com<br>
+        Masa akses: 30 hari dari tarikh ini
+      </p>
+    `
+  };
+  
+  // Implement actual email sending here
+  return emailContent;
+}
+
+// ============================================
+// 9. ANALYTICS & TRACKING
+// ============================================
+app.post('/api/analytics/track', (req, res) => {
+  const { event, data } = req.body;
+  
+  // In production: Send to Mixpanel, Google Analytics, etc.
+  console.log('Analytics event:', event, data);
+  
+  res.json({ tracked: true });
+});
+
+// ============================================
+// 10. REFUND HANDLING
+// ============================================
+app.post('/api/refunds/request', async (req, res) => {
+  try {
+    const { claimId, reason } = req.body;
+    const claim = db.claims.get(claimId);
+    
+    if (!claim || !claim.paymentIntentId) {
+      return res.status(404).json({ error: 'Claim not found' });
+    }
+    
+    // Check if within 14-day guarantee period
+    const daysSincePurchase = (Date.now() - new Date(claim.paidAt).getTime()) / (1000 * 60 * 60 * 24);
+    
+    if (daysSincePurchase > 14) {
+      return res.status(400).json({ error: 'Refund period expired (14 days)' });
+    }
+    
+    // Process refund via Stripe
+    const refund = await stripe.refunds.create({
+      payment_intent: claim.paymentIntentId,
+      reason: 'requested_by_customer',
+      metadata: { reason: reason }
+    });
+    
+    claim.status = 'refunded';
+    claim.refundedAt = new Date().toISOString();
+    
+    res.json({ 
+      refunded: true, 
+      refundId: refund.id,
+      amount: refund.amount / 100 
+    });
+    
+  } catch (error) {
+    console.error('Refund error:', error);
+    res.status(500).json({ error: 'Refund failed' });
+  }
+});
+
+// ============================================
+// SERVER START
+// ============================================
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`MatSelamat API running on port ${PORT}`);
+  console.log(`Webhook endpoint: /api/webhooks/stripe`);
+});
+
+// ============================================
+// ENVIRONMENT VARIABLES (.env)
+// ============================================
+/*
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+ANTHROPIC_API_KEY=sk-ant-...
+FRONTEND_URL=https://matselamat.com
+DATABASE_URL=postgresql://...
+NODE_ENV=production
+*/
